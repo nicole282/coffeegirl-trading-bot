@@ -2,235 +2,231 @@ import requests
 import time
 import hmac
 import hashlib
-import json
 from typing import Dict, List, Optional
 from config import Config
 
 class RoostooAPI:
-    """Roostoo交易所API封装"""
-    
+    """Roostoo交易所API封装（修复版）"""
+
     def __init__(self, config: Config):
         self.config = config
         self.base_url = config.BASE_URL
         self.api_key = config.API_KEY
         self.secret_key = config.SECRET_KEY
         self.session = requests.Session()
-        self.session.headers.update({"X-API-KEY": self.api_key})
-        
+
+    def _get_timestamp(self) -> str:
+        """获取13位毫秒时间戳"""
+        return str(int(time.time() * 1000))
+
     def _generate_signature(self, params: Dict) -> str:
-        """生成API签名"""
-        query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
-        return hmac.new(
+        """生成HMAC SHA256签名"""
+        sorted_keys = sorted(params.keys())
+        total_params = "&".join([f"{k}={params[k]}" for k in sorted_keys])
+
+        signature = hmac.new(
             self.secret_key.encode('utf-8'),
-            query_string.encode('utf-8'),
+            total_params.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-    
+
+        return signature
+
+    def _get_signed_headers(self, params: Dict) -> tuple:
+        """生成签名头部"""
+        params['timestamp'] = self._get_timestamp()
+        signature = self._generate_signature(params)
+
+        headers = {
+            'RST-API-KEY': self.api_key,
+            'MSG-SIGNATURE': signature
+        }
+
+        return headers, params
+
     def _request(self, method: str, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
         """发送API请求"""
         url = f"{self.base_url}{endpoint}"
-        
+
         if params is None:
             params = {}
-            
+
+        headers = {}
+        data = None
+
         if signed:
-            params['timestamp'] = int(time.time() * 1000)
-            params['signature'] = self._generate_signature(params)
-        
+            headers, signed_params = self._get_signed_headers(params)
+            if method.upper() == "POST":
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                sorted_keys = sorted(signed_params.keys())
+                data = "&".join([f"{k}={signed_params[k]}" for k in sorted_keys])
+                params = {}
+            else:
+                params = signed_params
+        else:
+            if endpoint == "/v3/ticker":
+                params['timestamp'] = self._get_timestamp()
+
         for attempt in range(self.config.RETRY_ATTEMPTS):
             try:
                 if method.upper() == "GET":
-                    response = self.session.get(url, params=params, timeout=self.config.TIMEOUT)
+                    response = self.session.get(url, params=params, headers=headers, timeout=self.config.TIMEOUT)
                 elif method.upper() == "POST":
-                    response = self.session.post(url, json=params, timeout=self.config.TIMEOUT)
+                    response = self.session.post(url, data=data, params=params, headers=headers, timeout=self.config.TIMEOUT)
                 else:
-                    raise ValueError(f"不支持的HTTP方法: {method}")
-                
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
                 response.raise_for_status()
                 return response.json()
-                
+
             except requests.exceptions.RequestException as e:
                 print(f"API请求失败 (尝试 {attempt + 1}/{self.config.RETRY_ATTEMPTS}): {e}")
+                if e.response:
+                    print(f"错误响应: {e.response.text}")
                 if attempt == self.config.RETRY_ATTEMPTS - 1:
-                    return {}
-                time.sleep(1)  # 重试前等待
-        
-        return {}
-    
+                    return {"Success": False, "ErrMsg": str(e)}
+                time.sleep(1)
+
+        return {"Success": False, "ErrMsg": "All retry attempts failed"}
+
+    def get_server_time(self) -> Dict:
+        return self._request("GET", "/v3/serverTime")
+
+    def get_exchange_info(self) -> Dict:
+        return self._request("GET", "/v3/exchangeInfo")
+
+    def get_ticker(self, pair: str = None) -> Dict:
+        params = {}
+        if pair:
+            if "USDT" in pair:
+                pair = pair.replace("USDT", "/USD")
+            params['pair'] = pair
+        return self._request("GET", "/v3/ticker", params)
+
+    def get_balance(self) -> Dict:
+        return self._request("GET", "/v3/balance", {}, signed=True)
+
+    def get_pending_count(self) -> Dict:
+        return self._request("GET", "/v3/pending_count", {}, signed=True)
+
+
+    def place_order(self, pair: str, side: str, order_type: str = "MARKET", quantity: float = None, price: float = None) -> Dict:
+        """下单 - 修复数量格式"""
+        # 确保符号格式正确
+        if "USDT" in pair:
+            pair = pair.replace("USDT", "/USD")
+        elif "/" not in pair:
+            pair = f"{pair}/USD"
+
+        print(f"   🔄 转换交易对: {pair}")
+        print(f"   📦 下单数量: {quantity} (类型: {type(quantity).__name__})")
+
+        # 确保数量是数字类型
+        # 最终数量清理
+        if quantity is not None:
+            # 转换为字符串并清理
+            if isinstance(quantity, float) and quantity.is_integer():
+                quantity_str = str(int(quantity))
+            else:
+                quantity_str = str(quantity)
+
+            # 移除不必要的尾随零和小数点
+            if '.' in quantity_str:
+                quantity_str = quantity_str.rstrip('0').rstrip('.') if '.'in quantity_str else quantity_str
+        else:
+            quantity_str = "0"
+
+        print(f"   🎯 最终数量字符串: '{quantity_str}'")
+        if quantity is not None:
+            quantity_str = str(quantity)
+            # 如果是整数，去掉小数部分
+            if quantity_str.endswith('.0'):
+                quantity_str = quantity_str[:-2]
+        else:
+            quantity_str = "0"
+
+        params = {
+            'pair': pair,
+            'side': side.upper(),
+            'type': order_type.upper(),
+            'quantity': quantity_str
+        }
+
+        if order_type.upper() == "LIMIT" and price is not None:
+            params['price'] = str(price)
+
+        print(f"   📤 发送参数: {params}")
+        return self._request("POST", "/v3/place_order", params, signed=True)
+
+    def query_order(self, order_id: str = None, pair: str = None, pending_only: bool = None) -> Dict:
+        params = {}
+        if order_id:
+            params['order_id'] = order_id
+        elif pair:
+            if "USDT" in pair:
+                pair = pair.replace("USDT", "/USD")
+            params['pair'] = pair
+            if pending_only is not None:
+                params['pending_only'] = 'TRUE' if pending_only else 'FALSE'
+
+        return self._request("POST", "/v3/query_order", params, signed=True)
+
+    def cancel_order(self, order_id: str = None, pair: str = None) -> Dict:
+        params = {}
+        if order_id:
+            params['order_id'] = order_id
+        elif pair:
+            if "USDT" in pair:
+                pair = pair.replace("USDT", "/USD")
+            params['pair'] = pair
+
+        return self._request("POST", "/v3/cancel_order", params, signed=True)
+
+    # 兼容性方法
     def get_account_info(self) -> Dict:
-        """获取账户信息"""
-        return self._request("GET", "/account", signed=True)
-    
+        return self.get_balance()
+
+
     def get_ticker_price(self, symbol: str) -> float:
-        """获取最新价格"""
-        data = self._request("GET", f"/ticker/price", {"symbol": symbol})
-        return float(data.get('price', 0)) if data else 0
-    
+        """获取最新价格 - 修复版"""
+        # 转换符号格式
+        if "USDT" in symbol:
+            pair = symbol.replace("USDT", "/USD")
+        else:
+            pair = symbol
+
+        data = self.get_ticker(pair)
+        print(f"   🔍 {symbol} 原始数据: {data}")
+
+        if data.get("Success") and "Data" in data:
+            # 尝试从Data中获取价格
+            if pair in data["Data"]:
+                last_price = data["Data"][pair].get("LastPrice", 0)
+                print(f"   💰 解析到价格: {last_price}")
+                return float(last_price)
+            elif data["Data"]:
+                # 如果没有精确匹配，取第一个交易对的价格
+                first_pair = list(data["Data"].keys())[0]
+                last_price = data["Data"][first_pair].get("LastPrice", 0)
+                print(f"   💰 使用第一个交易对价格: {last_price}")
+                return float(last_price)
+
+        print(f"   ❌ 无法解析价格，返回0")
+        return 0.0
+
     def get_klines(self, symbol: str, interval: str = "5m", limit: int = 100) -> List[Dict]:
-        """获取K线数据"""
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
-        return self._request("GET", "/klines", params) or []
-    
-    def get_order_book(self, symbol: str, limit: int = 20) -> Dict:
-        """获取订单簿"""
-        params = {"symbol": symbol, "limit": limit}
-        return self._request("GET", "/depth", params) or {}
-    
-    def get_24h_ticker(self, symbol: str) -> Dict:
-        """获取24小时行情"""
-        params = {"symbol": symbol}
-        return self._request("GET", "/ticker/24hr", params) or {}
-    
-    def place_order(self, symbol: str, side: str, quantity: float, 
-                   order_type: str = "MARKET") -> Dict:
-        """下单"""
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": order_type,
-            "quantity": round(quantity, 6)  # 确保精度
-        }
-        return self._request("POST", "/order", params, signed=True)
-    
-    def get_order(self, symbol: str, order_id: str) -> Dict:
-        """查询订单"""
-        params = {"symbol": symbol, "orderId": order_id}
-        return self._request("GET", "/order", params, signed=True)
-    
-    def cancel_order(self, symbol: str, order_id: str) -> Dict:
-        """取消订单"""
-        params = {"symbol": symbol, "orderId": order_id}
-        return self._request("DELETE", "/order", params, signed=True)
-    
-    def get_open_orders(self, symbol: str = None) -> List[Dict]:
-        """获取未成交订单"""
-        params = {"symbol": symbol} if symbol else {}
-        return self._request("GET", "/openOrders", params, signed=True) or []
-    
-    def get_market_data(self, symbol: str) -> Dict:
-        """获取综合市场数据（用于Horus数据对比）"""
-        try:
-            price = self.get_ticker_price(symbol)
-            klines = self.get_klines(symbol, "5m", 50)
-            orderbook = self.get_order_book(symbol, 10)
-            
-            return {
-                "symbol": symbol,
-                "current_price": price,
-                "price_change": self._calculate_price_change(klines) if klines else 0,
-                "volume_24h": self._calculate_volume(klines) if klines else 0,
-                "orderbook_depth": self._calculate_orderbook_depth(orderbook),
-                "timestamp": int(time.time() * 1000)
-            }
-        except Exception as e:
-            print(f"获取市场数据失败 {symbol}: {e}")
-            return {}
-    
-    def _calculate_price_change(self, klines: List[Dict]) -> float:
-        """计算价格变化"""
-        if len(klines) < 2:
-            return 0
-        current_price = float(klines[-1][4])  # 收盘价
-        previous_price = float(klines[0][4])
-        return ((current_price - previous_price) / previous_price) * 100
-    
-    def _calculate_volume(self, klines: List[Dict]) -> float:
-        """计算成交量"""
-        if not klines:
-            return 0
-        total_volume = sum(float(k[5]) for k in klines)  # 成交量
-        return total_volume
-    
-    def _calculate_orderbook_depth(self, orderbook: Dict) -> Dict:
-        """计算订单簿深度"""
-        if not orderbook or 'bids' not in orderbook or 'asks' not in orderbook:
-            return {"bid_depth": 0, "ask_depth": 0, "spread": 0}
-        
-        bids = orderbook['bids']
-        asks = orderbook['asks']
-        
-        bid_depth = sum(float(bid[1]) for bid in bids[:5])  # 前5档买单深度
-        ask_depth = sum(float(ask[1]) for ask in asks[:5])  # 前5档卖单深度
-        
-        best_bid = float(bids[0][0]) if bids else 0
-        best_ask = float(asks[0][0]) if asks else 0
-        spread = best_ask - best_bid if best_ask and best_bid else 0
-        
-        return {
-            "bid_depth": bid_depth,
-            "ask_depth": ask_depth,
-            "spread": spread,
-            "spread_percentage": (spread / best_bid * 100) if best_bid else 0
-        }
-    
+        print(f"⚠️ K线数据需要从Horus API获取: {symbol}")
+        return []
+
     def validate_api_connection(self) -> bool:
-        """验证API连接是否正常"""
         try:
-            # 测试获取价格（不需要签名的简单请求）
-            price = self.get_ticker_price(self.config.SYMBOLS[0])
-            if price > 0:
+            time_data = self.get_server_time()
+            if "ServerTime" in time_data:
                 print("✅ Roostoo API连接正常")
                 return True
             else:
-                print("❌ Roostoo API连接失败：无法获取价格")
+                print("❌ Roostoo API连接失败")
                 return False
         except Exception as e:
             print(f"❌ Roostoo API连接异常: {e}")
             return False
-    
-    def get_trading_pairs_info(self) -> List[Dict]:
-        """获取可交易对信息"""
-        pairs_info = []
-        for symbol in self.config.SYMBOLS:
-            try:
-                price = self.get_ticker_price(symbol)
-                klines = self.get_klines(symbol, "1h", 24)
-                
-                if price > 0 and klines:
-                    # 计算24小时波动率
-                    prices = [float(k[4]) for k in klines]  # 收盘价
-                    volatility = self._calculate_volatility(prices)
-                    
-                    pairs_info.append({
-                        "symbol": symbol,
-                        "price": price,
-                        "volatility_24h": volatility,
-                        "status": "TRADING"
-                    })
-                else:
-                    pairs_info.append({
-                        "symbol": symbol,
-                        "price": 0,
-                        "volatility_24h": 0,
-                        "status": "UNAVAILABLE"
-                    })
-                    
-            except Exception as e:
-                print(f"获取交易对信息失败 {symbol}: {e}")
-                pairs_info.append({
-                    "symbol": symbol,
-                    "price": 0,
-                    "volatility_24h": 0,
-                    "status": "ERROR"
-                })
-        
-        return pairs_info
-    
-    def _calculate_volatility(self, prices: List[float]) -> float:
-        """计算价格波动率"""
-        if len(prices) < 2:
-            return 0
-        
-        returns = []
-        for i in range(1, len(prices)):
-            if prices[i-1] > 0:
-                returns.append((prices[i] - prices[i-1]) / prices[i-1])
-        
-        if not returns:
-            return 0
-            
-        return (max(returns) - min(returns)) * 100  # 百分比波动率
